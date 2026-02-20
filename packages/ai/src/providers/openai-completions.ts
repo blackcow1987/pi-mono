@@ -232,12 +232,56 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 						if (currentBlock.type === "thinking") {
 							const delta = (choice.delta as any)[foundReasoningField];
 							currentBlock.thinking += delta;
+
 							stream.push({
 								type: "thinking_delta",
 								contentIndex: blockIndex(),
 								delta,
 								partial: output,
 							});
+
+							if (currentBlock.thinking.includes("</tool_call>")) {
+								const toolCalls = extractAllXmlToolCalls(currentBlock.thinking);
+
+								for (const toolCall of toolCalls) {
+									finishCurrentBlock(currentBlock);
+									currentBlock = {
+										type: "toolCall",
+										id: `call_${Math.random().toString(36).substring(2, 10)}`,
+										name: toolCall.name,
+										arguments: {},
+										partialArgs: JSON.stringify(toolCall.arguments),
+									};
+
+									output.content.push(currentBlock);
+									output.stopReason = "toolUse";
+									stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+
+									stream.push({
+										type: "toolcall_delta",
+										contentIndex: blockIndex(),
+										delta: JSON.stringify(toolCall.arguments),
+										partial: output,
+									});
+								}
+								finishCurrentBlock(currentBlock);
+
+								currentBlock = {
+									type: "thinking",
+									thinking: "",
+									thinkingSignature: foundReasoningField,
+								};
+								output.content.push(currentBlock);
+								stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
+								const delta = `\n( TOOL CALLING IN THINKING MODE ... )`;
+								currentBlock.thinking += delta;
+								stream.push({
+									type: "thinking_delta",
+									contentIndex: blockIndex(),
+									delta,
+									partial: output,
+								});
+							}
 						}
 					}
 
@@ -485,6 +529,43 @@ function maybeAddOpenRouterAnthropicCacheControl(
 			}
 		}
 	}
+}
+
+function extractAllXmlToolCalls(text: string): Array<{ name: string; arguments: Record<string, any> }> {
+	const results: Array<{ name: string; arguments: Record<string, any> }> = [];
+
+	const toolCallRegex = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+	// const toolCallRegex =  /^[^\S\r\n]*<tool_call>[^\S\r\n]*[\r\n]+([\s\S]*?)^[^\S\r\n]*<\tool_call>[^\S\r\n]*$/gms;
+
+	// 루프 외부에서 할당
+	let toolCallMatch = toolCallRegex.exec(text);
+
+	while (toolCallMatch !== null) {
+		const innerContent = toolCallMatch[1];
+		const functionRegex = /<function=(\w+)>([\s\S]*?)<\/function>/g;
+
+		let functionMatch = functionRegex.exec(innerContent);
+
+		while (functionMatch !== null) {
+			const name = functionMatch[1];
+			const parametersContent = functionMatch[2];
+			const args: Record<string, any> = {};
+
+			const paramRegex = /<parameter=(\w+)>([\s\S]*?)<\/parameter>/g;
+			let paramMatch = paramRegex.exec(parametersContent);
+
+			while (paramMatch !== null) {
+				args[paramMatch[1]] = paramMatch[2].trim();
+				paramMatch = paramRegex.exec(parametersContent);
+			}
+
+			results.push({ name, arguments: args });
+			functionMatch = functionRegex.exec(innerContent);
+		}
+		toolCallMatch = toolCallRegex.exec(text);
+	}
+
+	return results;
 }
 
 export function convertMessages(
